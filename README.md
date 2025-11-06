@@ -23,6 +23,7 @@ STMから受け取ったセンサデータなどをWi-Fi経由でPCへ送信し�
 | フラッシュサイズ | 4MB (FS: 1MB OTA: 1019KB) 推奨 |
 | CPU周波数 | 80MHz または 160MHz |
 | 書き込み速度 | 115200bps |
+# ※フラッシュサイズは超重要
 
 📘 秋月技術資料 → [AE-ESP-WROOM02-DEV.pdf](https://akizukidenshi.com/goodsaffix/AE-ESP-WROOM02-DEV.pdf)
 
