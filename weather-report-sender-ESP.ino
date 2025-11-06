@@ -1,5 +1,7 @@
-// CCBT_wifi_earlyACK.ino
-// RST起床 → NTP同期 → STMとWio互換セッション(全件受信・END) → 即ACK返却 → Soracom Inventory /publish(UNIX秒, 分割送信/詳細ログ) → DeepSleep
+// CCBT_wifi_earlyACK_LittleFS.ino
+// RST起床 → NTP同期 → STM(Wio互換)から全件受信（START/TS/HEXの行中検出・強耐性）→ LittleFSへ逐次保存
+// → 受信直後に EARLY ACK（"ACK <ts>\r\n" を正しく送出） → LittleFSからBATCH分割で Soracom Inventory /publish
+// → DeepSleep
 // 依存: ConfigPortal.h / CredStore.h（既存プロジェクトのもの）
 // MCU: ESP8266
 
@@ -7,19 +9,21 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
-#include <time.h> // ★ NTP (時刻取得) のために追加
+#include <FS.h>
+#include <LittleFS.h>
+#include <time.h>
 
 // ========= Soracom Inventory (/publish) =========
 static const char* DEVICE_ID     = "d-bne1ulprdk8oh07f6nn2";
 static const char* DEVICE_SECRET = "dByvgJd/kZKrM0z19OTcdA==";
 static const char* PUBLISH_URL   = "https://api.soracom.io/v1/devices/d-bne1ulprdk8oh07f6nn2/publish";
 
-// ========= NTP (時刻取得) 設定 ★ 追加 =========
+// ========= NTP (時刻取得) =========
 static const char* NTP_SERVER_1 = "ntp.nict.jp";
 static const char* NTP_SERVER_2 = "pool.ntp.org";
 static const long  NTP_TZ_SEC   = 9 * 3600; // JST (UTC+9)
-static const int   NTP_DAYLIGHT = 0;        // 夏時間なし
-static const uint32_t NTP_TIMEOUT_MS = 15000; // NTP同期タイムアウト
+static const int   NTP_DAYLIGHT = 0;
+static const uint32_t NTP_TIMEOUT_MS = 15000;
 
 // ========= Config Portal / Credential Store =========
 #include "ConfigPortal.h"
@@ -32,19 +36,23 @@ static const uint32_t NTP_TIMEOUT_MS = 15000; // NTP同期タイムアウト
 #define WAKE_TOKEN_BYTE   0xA5
 
 // ========= パラメータ =========
-static const uint16_t BATCH_SIZE        = 50;     // 1バッチ件数（20〜40推奨）
+static const uint16_t BATCH_SIZE        = 50;     // 1バッチ件数（20〜50推奨）
 static const uint16_t MAX_TOTAL         = 1800;   // 一回で送る上限
 static const uint32_t HTTP_TIMEOUT_MS   = 30000;  // HTTPSタイムアウト
 static const uint8_t  HTTP_RETRY_MAX    = 3;      // HTTPリトライ回数
 static const uint16_t BATCH_INTERVAL_MS = 400;    // バッチ間隔
 static const uint16_t UART_LINE_MAX     = 256;    // 1行の上限（越えたら破棄）
-static const uint16_t UART_RXBUF        = 1024;   // 受信FIFOサイズ
-static const uint8_t  TOKEN_RETRY_MAX   = 3;      // トークン再送回数
+static const uint16_t UART_RXBUF        = 2048;   // 受信FIFOサイズ（取りこぼし対策）
+static const uint8_t  TOKEN_RETRY_MAX   = 3;      // トークン再送回数（必要時）
 static const uint32_t TOKEN_RETRY_GAPMS = 200;    // 再送間隔
 static const uint32_t START_WAIT_MS     = 20000;  // START待ち
 static const uint32_t TS_WAIT_MS        = 6000;   // TS=待ち
 static const uint32_t HEX_WAIT_MS       = 6000;   // HEX待ち
 static const uint32_t END_WAIT_MS       = 1500;   // END参考待ち
+
+// LittleFS
+static const char* PATH_SLOTS = "/sbf.tmp";       // 逐次保存ファイル（受信中は追記、送信後に削除）
+static const size_t FS_MIN_FREE = 32 * 1024;      // 最低余裕（安全マージン）
 
 // ====== デバッグマクロ ======
 #define TRACE_ON 1
@@ -56,6 +64,8 @@ static const uint32_t END_WAIT_MS       = 1500;   // END参考待ち
 
 static void dump_line(const String& s, const char* tag="LINE") {
   if (!TRACE_ON) return;
+  static uint32_t dump_count = 0;
+  if ((++dump_count % 8) != 1) return; // 取りこぼし防止のため間引き
   Serial.printf("[DUMP][%s] len=%u: '", tag, (unsigned)s.length());
   for (size_t i=0;i<s.length();++i){
     char c = s[i];
@@ -122,39 +132,116 @@ static inline uint16_t rd_u16(const uint8_t* p){ return (uint16_t)(p[0] | (p[1] 
 static inline int32_t  rd_s32(const uint8_t* p){ return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24)); }
 static inline uint32_t rd_u32(const uint8_t* p){ return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)); }
 
+// ===== START/TS/HEX — 行中検出 =========
+static bool parse_start_from_line(const String& line, uint16_t& out_count) {
+  int pos = line.indexOf(F("START "));
+  if (pos < 0) return false;
+  pos += 6;
+  uint32_t v = 0; bool any=false;
+  while (pos < (int)line.length()) {
+    char c = line[pos++];
+    if (c >= '0' && c <= '9') { v = v*10 + (c - '0'); any = true; }
+    else break;
+  }
+  if (!any) return false;
+  out_count = (uint16_t)v;
+  return (out_count > 0);
+}
+
+static bool parse_ts_from_line(const String& line, uint32_t& ts) {
+  int pos = line.indexOf(F("TS="));
+  if (pos < 0) return false;
+  pos += 3;
+  uint32_t v=0; bool any=false;
+  while (pos < (int)line.length()) {
+    char c = line[pos++];
+    if (c>='0' && c<='9') { v = v*10 + (c-'0'); any=true; }
+    else break;
+  }
+  if (!any) return false;
+  ts = v; return true;
+}
+
+static bool pick_hex56_from_line(const String& line, char hex56_out[57]) {
+  auto isHex = [](char c){
+    return (c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f');
+  };
+  if ((int)line.length() >= 56) {
+    bool ok=true;
+    for (int i=line.length()-56; i<(int)line.length(); ++i) {
+      if (!isHex(line[i])) { ok=false; break; }
+    }
+    if (ok) {
+      memcpy(hex56_out, line.c_str() + (line.length()-56), 56);
+      hex56_out[56]='\0';
+      return true;
+    }
+  }
+  for (int i=0; i+56 <= (int)line.length(); ++i) {
+    bool ok=true;
+    for (int k=0; k<56; ++k) { if (!isHex(line[i+k])) { ok=false; break; } }
+    if (ok) {
+      memcpy(hex56_out, line.c_str()+i, 56);
+      hex56_out[56]='\0';
+      return true;
+    }
+  }
+  return false;
+}
+
+// ===== LittleFS レコードI/O =====
+struct __attribute__((packed)) SlotRec {
+  uint32_t ts_hdr;
+  uint8_t  raw[28];
+};
+
+static bool fs_init() {
+  if (LittleFS.begin()) return true;
+  DBG("LittleFS begin failed, try format...");
+  LittleFS.format();
+  bool ok = LittleFS.begin();
+  if (!ok) DBG("LittleFS begin failed after format");
+  return ok;
+}
+
+static size_t fs_free_bytes() {
+  FSInfo info;
+  if (!LittleFS.info(info)) return 0;
+  // 残容量（概算）
+  size_t used = info.usedBytes;
+  size_t total = info.totalBytes;
+  return (total > used) ? (total - used) : 0;
+}
+
+// ===== JSON 生成（Wio側合わせ）=====
 static void json_append_from_raw28(String& buf, const uint8_t raw[28],
                                    uint32_t ts_hdr, uint32_t time_offset_unix)
 {
-  // ---- 正しいオフセット（上表）----
-  const uint32_t ts   = rd_u32(&raw[0x00]);   // 使わない運用でもOK
+  const uint32_t ts   = rd_u32(&raw[0x00]);   (void)ts; // 破損前提のため未使用でもOK
   const int16_t  a    = rd_s16(&raw[0x04]);
   const int16_t  b    = rd_s16(&raw[0x06]);
   const int16_t  c    = rd_s16(&raw[0x08]);
   const int16_t  t    = rd_s16(&raw[0x0A]);
   const int32_t  p    = rd_s32(&raw[0x0C]);
   const int16_t  h    = rd_s16(&raw[0x10]);
-  const uint16_t xraw = rd_u16(&raw[0x12]);
-  const int32_t  xmv  = rd_s32(&raw[0x14]);   // mV相当（int/float運用どちらでも可）
-  // raw[0x18..0x19] 予備2B（rsv）
-  // raw[0x1A..0x1B] crc16（読み出し不要）
+  const uint16_t xraw = rd_u16(&raw[0x12]);  (void)xraw;
+  const int32_t  xmv  = rd_s32(&raw[0x14]);  // mV相当
 
-  // ---- スケール & 丸め（Wio側に揃える）----
   const float tempC   = roundf((t   / 100.0f)  * 100.0f)  / 100.0f;
-  const float pressKP = roundf((p   / 1000.0f) * 1000.0f) / 1000.0f;  // 例: 101.179 kPa
+  const float pressKP = roundf((p   / 1000.0f) * 1000.0f) / 1000.0f;  // 例: 101.179
   const float humidP  = roundf((h   / 100.0f)  * 100.0f)  / 100.0f;
-  const float mx      = fabsf(roundf((a / 100.0f) * 100.0f) / 100.0f); // 参照仕様では fabs
+  const float mx      = fabsf(roundf((a / 100.0f) * 100.0f) / 100.0f);
   const float my      =       roundf((b / 100.0f) * 100.0f) / 100.0f;
   const float mz      =       roundf((c / 100.0f) * 100.0f) / 100.0f;
-  const float adc_f   = roundf(((float)xmv)     * 100.0f)  / 100.0f;   // 2桁丸め
+  const float adc_f   = roundf(((float)xmv)     * 100.0f)  / 100.0f;
 
   const uint32_t final_ts = (time_offset_unix > 0) ? (ts_hdr + time_offset_unix) : ts_hdr;
 
-  // ---- JSON（フィールド名・桁数も揃える）----
   buf += F("{\"time\":");    buf += String(final_ts);
   buf += F(",\"temp\":");    buf += String(tempC, 2);
-  buf += F(",\"press\":");   buf += String(pressKP, 3);   // ★ 3桁
+  buf += F(",\"press\":");   buf += String(pressKP, 3);
   buf += F(",\"humid\":");   buf += String(humidP, 2);
-  buf += F(",\"adc_mV\":");  buf += String(adc_f, 2);     // ★ 2桁
+  buf += F(",\"adc_mV\":");  buf += String(adc_f, 2);
   buf += F(",\"mag\":{");
     buf += F("\"mag_x\":");  buf += String(mx, 2);  buf += F(",");
     buf += F("\"mag_y\":");  buf += String(my, 2);  buf += F(",");
@@ -162,22 +249,16 @@ static void json_append_from_raw28(String& buf, const uint8_t raw[28],
   buf += F("}}");
 }
 
-
-
-
-  // ★ NTPで計算したオフセットを加算し、絶対UNIX時刻に変換
- 
-
-// ===== /publish POST（詳細ログ＋リトライ＋Connection: close＋WDTケア） =====
+// ===== /publish POST =====
 static bool post_publish(const String& payload, int& code_out, String& body_out) {
   BearSSL::WiFiClientSecure tls;
   tls.setTimeout(HTTP_TIMEOUT_MS);
   tls.setInsecure();                 // 本番はCA設定推奨
-  tls.setBufferSizes(4096, 1024);    // 受信/送信バッファ（必要に応じ調整）
+  tls.setBufferSizes(4096, 1024);
 
   HTTPClient https;
   https.setTimeout(HTTP_TIMEOUT_MS);
-  https.setReuse(false); // keep-alive無効
+  https.setReuse(false);
   DBG("HTTP begin (len=%u)", payload.length());
   if (!https.begin(tls, PUBLISH_URL)) {
     DBG("HTTP begin failed");
@@ -197,7 +278,7 @@ static bool post_publish(const String& payload, int& code_out, String& body_out)
     int code = https.POST(payload);
     String resp = https.getString();
     DBG("HTTP code=%d", code);
-    if (resp.length() && TRACE_ON) Serial.println(resp); // DEMコード等をそのままダンプ
+    if (resp.length() && TRACE_ON) Serial.println(resp);
     code_out = code; body_out = resp;
     if (code > 0 && code >= 200 && code < 300) { ok = true; break; }
     if (attempt < HTTP_RETRY_MAX) {
@@ -213,9 +294,14 @@ static bool post_publish(const String& payload, int& code_out, String& body_out)
   return ok;
 }
 
-// ======== STMセッション(全件受信) → 即ACK返却 → /publish分割送信(詳細ログ) ========
-// ★ NTPで取得した現在時刻 (UNIX秒) を引数で受け取る
+// ===== 受信→LittleFS 保存 → EARLY ACK → LittleFS から分割送信 =====
 static bool run_and_upload_session(uint32_t ntp_now_unix) {
+  // LittleFS
+  if (!fs_init()) { DBG("FS init failed"); return false; }
+  LittleFS.remove(PATH_SLOTS); // 前回残骸があれば消す（安全）
+  File f = LittleFS.open(PATH_SLOTS, "w");
+  if (!f) { DBG("FS open(w) failed"); return false; }
+
   // UART開始（STM直結）
   Serial.flush();
   Serial.begin(STM_BAUD);
@@ -227,82 +313,73 @@ static bool run_and_upload_session(uint32_t ntp_now_unix) {
   uint32_t ddl = millis() + 3;
   while ((int32_t)(millis()-ddl) < 0) { while (Serial.available()) (void)Serial.read(); delay(0); }
 
-  // // トークン送信（最大 TOKEN_RETRY_MAX 回）
-  // for (uint8_t k=0;k<TOKEN_RETRY_MAX;++k) {
-  //   Serial.write((uint8_t)WAKE_TOKEN_BYTE);
-  //   Serial.flush();
-  //   DBG("Sent WAKE TOKEN (0x%02X) try=%u", WAKE_TOKEN_BYTE, k+1);
-  //   delay(TOKEN_RETRY_GAPMS);
-  //   yield();
-  // }
+  // WAKE TOKEN（単発）
   delay(200);
   Serial.write((uint8_t)WAKE_TOKEN_BYTE);
   Serial.flush();
-  DBG("Sent WAKE TOKEN (0x%02X) try=%u", WAKE_TOKEN_BYTE, 1);
+  DBG("Sent WAKE TOKEN (0x%02X)", WAKE_TOKEN_BYTE);
 
-  // START <count> を待つ（ゴミ行は全て捨てる）
+  // START 待ち（行中検出）
   String line;
   uint32_t tstart_deadline = millis() + START_WAIT_MS;
   long count_hdr = -1;
   while ((int32_t)(millis()-tstart_deadline) < 0) {
     if (!uart_read_line(Serial, line, 1000)) { delay(0); yield(); continue; }
     if (line.length()==0) { delay(0); yield(); continue; }
-    if (line.startsWith("START ")) {
-      if (sscanf(line.c_str(), "START %ld", &count_hdr) == 1 && count_hdr > 0) break;
-      DBG("START line parse fail"); dump_line(line,"START?");
-      count_hdr = -1; // 継続
-    } else {
-      dump_line(line, "SKIP");
-    }
+    uint16_t cc=0;
+    if (parse_start_from_line(line, cc)) { count_hdr = cc; break; }
+    dump_line(line, "SKIP");
     delay(0); yield();
   }
-  if (count_hdr <= 0) { DBG("START timeout or invalid"); return false; }
+  if (count_hdr <= 0) { DBG("START timeout or invalid"); f.close(); LittleFS.remove(PATH_SLOTS); return false; }
 
   uint16_t target = (uint16_t)count_hdr;
   if (target > MAX_TOTAL) target = MAX_TOTAL;
   DBG("START count=%u", target);
 
-  // メモリ確保（全件分）
-  struct RawSlot { uint8_t raw[28]; uint32_t ts_hdr; };
-  size_t alloc_sz = sizeof(RawSlot) * target;
-  RawSlot* slots = (RawSlot*)malloc(alloc_sz);
-  if (!slots) { DBG("malloc(%u) failed", (unsigned)alloc_sz); return false; }
-  DBG("malloc ok (%u bytes)", (unsigned)alloc_sz);
-
-  // 受信ループ
+  // 受信ループ（FSに逐次保存）
   uint16_t frames_ok = 0;
   uint32_t max_ts_good = 0;
 
   for (uint16_t i=0; i<target; ++i) {
-    // TS=... を探す
+    // FS 空きチェック（安全マージン）
+    if (fs_free_bytes() < (sizeof(SlotRec) + FS_MIN_FREE)) {
+      DBG("FS low space, stop receive at i=%u", i);
+      break;
+    }
+
+    // TS=抽出
     bool got_ts = false;
     for (uint8_t scan=0; scan<8; ++scan) {
       if (!uart_read_line(Serial, line, TS_WAIT_MS)) { DBG("TS timeout at i=%u", i); break; }
-      if (line.startsWith("TS=")) { got_ts = true; break; }
-      dump_line(line, "DROP");
+      uint32_t ts_hdr = 0;
+      if (parse_ts_from_line(line, ts_hdr)) {
+        SlotRec rec; rec.ts_hdr = ts_hdr;
+        // HEX 56抽出
+        if (!uart_read_line(Serial, line, HEX_WAIT_MS)) { DBG("HEX timeout at i=%u", i); break; }
+
+        char hex56[57];
+        if (!pick_hex56_from_line(line, hex56)) { DBG("HEX pick fail at i=%u", i); dump_line(line,"HEX?"); break; }
+        if (!hex_to_bytes_28(hex56, rec.raw)) { DBG("HEX parse fail at i=%u", i); break; }
+
+        // 書き込み
+        size_t w = f.write((const uint8_t*)&rec, sizeof(rec));
+        if (w != sizeof(rec)) { DBG("FS write fail at i=%u (w=%u)", i, (unsigned)w); break; }
+
+        frames_ok++;
+        if (ts_hdr > max_ts_good) max_ts_good = ts_hdr;
+
+        if (TRACE_ON && (frames_ok % 20 == 1)) {
+          Serial.printf("[RECV] i=%u ts_hdr=%lu\n", (unsigned)i, (unsigned long)ts_hdr);
+        }
+        got_ts = true;
+        break;
+      } else {
+        dump_line(line, "DROP");
+      }
       delay(0); yield();
     }
     if (!got_ts) { DBG("TS resync fail at i=%u", i); break; }
-
-    uint32_t ts_hdr = 0;
-    if (sscanf(line.c_str()+3, "%lu", &ts_hdr) != 1) {
-      DBG("TS value parse fail at i=%u", i); dump_line(line,"TS?"); break;
-    }
-
-    // HEX（56文字）
-    if (!uart_read_line(Serial, line, HEX_WAIT_MS)) { DBG("HEX timeout at i=%u", i); break; }
-    if (line.length() != 56) { DBG("HEX len=%u (expected 56) at i=%u", (unsigned)line.length(), i); dump_line(line,"HEX?"); break; }
-    if (!hex_to_bytes_28(line.c_str(), slots[frames_ok].raw)) { DBG("HEX parse fail at i=%u", i); dump_line(line,"HEX!"); break; }
-
-    slots[frames_ok].ts_hdr = ts_hdr;
-    if (ts_hdr > max_ts_good) max_ts_good = ts_hdr;
-    frames_ok++;
-
-    // ★ (デバッグログ追記 1/2) STMから受信したts_hdrをそのまま表示
-    if (TRACE_ON) {
-      Serial.printf("[RECV] i=%u ts_hdr=%lu\n", (unsigned)i, (unsigned long)ts_hdr);
-    }
-
 
     if ((frames_ok % 50) == 0) { DBG("recv %u/%u ...", frames_ok, target); }
     if ((frames_ok % 10) == 0) { delay(0); yield(); }
@@ -313,68 +390,47 @@ static bool run_and_upload_session(uint32_t ntp_now_unix) {
   if (line.length()) dump_line(line,"TAIL");
 
   DBG("RECV DONE frames_ok=%u, max_ts_good=%lu", frames_ok, (unsigned long)max_ts_good);
+  f.flush(); f.close();
 
-  // ★★★ デバッグログ追記: 受信した全ts_hdrを一覧表示 ★★★
-  if (TRACE_ON && frames_ok > 0) {
-    DBG("--- START Dump All Received ts_hdr (frames_ok=%u) ---", frames_ok);
-    String ts_line = "";
-    ts_line.reserve(128); // 1行あたりのバッファ
-    for (uint16_t i = 0; i < frames_ok; ++i) {
-      if (i > 0) ts_line += ", ";
-      
-      // 1行が長くなりすぎたら改行 (approx 10 per line)
-      if (ts_line.length() > 100) {
-        Serial.println(ts_line);
-        ts_line = "";
-      }
-      ts_line += String(slots[i].ts_hdr);
-    }
-    // 最後の行を出力
-    if (ts_line.length() > 0) {
-      Serial.println(ts_line);
-    }
-    DBG("--- END Dump All Received ts_hdr ---");
-  }
-  // ★★★ 追記ここまで ★★★
-
-
-  // ========= ★ NTPオフセット計算 ★ =========
-  // (NTP時刻 - STMの最新相対秒数) = オフセット
+  // ========= NTPオフセット =========
   uint32_t time_offset_unix = 0;
   if (frames_ok > 0 && ntp_now_unix > max_ts_good) {
     time_offset_unix = ntp_now_unix - max_ts_good;
-    DBG("NTP offset calculated: now=%lu - max_ts=%lu = %lu", (unsigned long)ntp_now_unix, (unsigned long)max_ts_good, (unsigned long)time_offset_unix);
+    DBG("NTP offset: now=%lu - max_ts=%lu = %lu", (unsigned long)ntp_now_unix, (unsigned long)max_ts_good, (unsigned long)time_offset_unix);
   } else {
     DBG("NTP offset SKIPPED (ntp=%lu, max_ts=%lu). Using relative time.", (unsigned long)ntp_now_unix, (unsigned long)max_ts_good);
   }
-  // (NTP失敗時(ntp_now_unix=0) や max_ts_good がおかしい場合は offset=0 となり、
-  // json_append... 側でフォールバック処理される)
 
-  delay(100);
-
-  // ========= ここで即ACK（要求通り：受信直後に返す）=========
+  // ========= EARLY ACK（正しい文字列を返す）=========
   {
-    char ack[32];
-    unsigned long ack_ts = (frames_ok > 0) ? max_ts_good : 0UL; // 受信できていれば最大TS、失敗なら0
+    // char ack[32];
+    // unsigned long ack_ts = (frames_ok > 0) ? max_ts_good : 0UL;
     // snprintf(ack, sizeof(ack), "ACK %lu\r\n", ack_ts);
+    // Serial.print(ack);   // ★ 文字列として送る
+    // Serial.flush();
+    // DBG("ACK sent EARLY: %s", ack);
+
+    delay(200);
     Serial.write((uint8_t)0xBB);
-    Serial.print(ack); // ★注意: ack[32] は初期化されていないため、不定な文字列が送信されます
     Serial.flush();
-    DBG("ACK sent EARLY: %s", ack); // ★注意: ack は不定値です
+    DBG("Sent WAKE TOKEN (0x%02X)", 0xBB);
   }
 
   if (frames_ok == 0) {
-    free(slots);
+    LittleFS.remove(PATH_SLOTS);
     return false; // 以降のHTTPは行わない
   }
 
-  // ========= ここからHTTP分割送信（詳細ログ/201,207,400等を表示）=========
+  // ========= LittleFS から読み出し→ /publish 分割送信 =========
+  File rf = LittleFS.open(PATH_SLOTS, "r");
+  if (!rf) { DBG("FS open(r) failed"); LittleFS.remove(PATH_SLOTS); return false; }
+
   uint32_t posted = 0, batches = 0;
   bool all_ok = true;
 
-  int first_code = 0;          // 最初のHTTPコード
-  int last_code  = 0;          // 最後のHTTPコード
-  int worst_code = 0;          // 200台以外を記録（代表エラーコード）
+  int first_code = 0;
+  int last_code  = 0;
+  int worst_code = 0;
   uint32_t code_2xx = 0, code_3xx = 0, code_4xx = 0, code_5xx = 0, code_err = 0;
 
   String last_body;
@@ -396,9 +452,10 @@ static bool run_and_upload_session(uint32_t ntp_now_unix) {
     payload += F("{\"data\":[");
     payload += batchBody;
     payload += F("]}");
-    if (TRACE_ON) Serial.println(payload); // デバッグ用にペイロード表示
 
     DBG("POST batch rec=%u len=%u", (unsigned)rec_in_batch, (unsigned)payload.length());
+    if (TRACE_ON) Serial.println(payload);
+
     int code = 0; String body;
     bool ok = post_publish(payload, code, body);
 
@@ -413,20 +470,24 @@ static bool run_and_upload_session(uint32_t ntp_now_unix) {
                   (ok ? "SUCCESS" : "FAIL"));
 
     if (!ok) {
-      all_ok = false; // 失敗しても続ける（できるだけ他バッチも投げ切る）
+      all_ok = false;
     }
 
-    batchBody.remove(0); // capacity保持
+    batchBody.remove(0);
     delay(BATCH_INTERVAL_MS);
     yield();
     return ok;
   };
 
   uint16_t inBatch = 0;
-  for (uint16_t i=0; i<frames_ok; ++i) {
+  rf.seek(0, SeekSet);
+  for (uint32_t i=0; i<frames_ok; ++i) {
+    SlotRec rec;
+    size_t r = rf.read((uint8_t*)&rec, sizeof(rec));
+    if (r != sizeof(rec)) { DBG("FS short read at i=%lu (r=%u)", (unsigned long)i, (unsigned)r); break; }
+
     if (inBatch > 0) batchBody += ",";
-    // ★ オフセットを渡す
-    json_append_from_raw28(batchBody, slots[i].raw, slots[i].ts_hdr, time_offset_unix); 
+    json_append_from_raw28(batchBody, rec.raw, rec.ts_hdr, time_offset_unix);
     inBatch++;
 
     if (inBatch >= BATCH_SIZE) {
@@ -444,11 +505,13 @@ static bool run_and_upload_session(uint32_t ntp_now_unix) {
     batches++;
   }
 
+  rf.close();
+  LittleFS.remove(PATH_SLOTS); // 後始末
+
   DBG("HTTP SUMMARY: first=%d last=%d worst=%d  2xx=%lu 3xx=%lu 4xx=%lu 5xx=%lu err=%lu",
       first_code, last_code, worst_code,
       (unsigned long)code_2xx,(unsigned long)code_3xx,(unsigned long)code_4xx,(unsigned long)code_5xx,(unsigned long)code_err);
 
-  // 人間が見やすいRESULT行（STM側で任意に読む用）
   {
     String msg = last_body;
     msg.replace("\r"," "); msg.replace("\n"," ");
@@ -461,8 +524,8 @@ static bool run_and_upload_session(uint32_t ntp_now_unix) {
     Serial.flush();
   }
 
-  free(slots);
-  DBG("SESSION DONE frames_ok=%u posted=%lu batches=%lu all_ok=%d", frames_ok, (unsigned long)posted, (unsigned long)batches, (int)all_ok);
+  DBG("SESSION DONE frames_ok=%u posted=%lu batches=%lu all_ok=%d",
+      frames_ok, (unsigned long)posted, (unsigned long)batches, (int)all_ok);
   return all_ok;
 }
 
@@ -480,7 +543,7 @@ void setup() {
   Serial.printf("[BOOT] resetReason=%s\n", ESP.getResetReason().c_str());
   Serial.println(F("[BOOT] Wio-compatible session on ESP8266 -> Inventory /publish (UNIX秒)"));
 
-  WiFi.setSleep(false); // 送信中の遅延対策（必要に応じてtrueに）
+  WiFi.setSleep(false);
   CredStore_begin();
 
   if (CredStore_load(g_ssid, g_pass)) {
@@ -527,18 +590,16 @@ void loop() {
       if (WiFi.status() == WL_CONNECTED) {
         Serial.println(F("[NET] WiFi connected."));
         
-        // ========= ★ NTP (時刻同期) 処理 ★ =========
+        // NTP
         DBG("NTP sync starting... (TZ=JST-9)");
         configTime(NTP_TZ_SEC, NTP_DAYLIGHT, NTP_SERVER_1, NTP_SERVER_2);
-        
         time_t now = time(nullptr);
         uint32_t ntp_start_ms = millis();
-        while (now < 1672531200UL && (millis() - ntp_start_ms) < NTP_TIMEOUT_MS) { // 2023年より前なら未同期とみなす
+        while (now < 1672531200UL && (millis() - ntp_start_ms) < NTP_TIMEOUT_MS) {
           delay(100);
           yield();
           now = time(nullptr);
         }
-
         uint32_t ntp_now_unix = 0;
         if (now >= 1672531200UL) {
           ntp_now_unix = (uint32_t)now;
@@ -546,10 +607,9 @@ void loop() {
         } else {
           DBG("NTP sync FAILED (timeout). Using relative time.");
         }
-        // ===========================================
 
-        Serial.println(F("[NET] Starting STM session & /publish upload (EARLY ACK MODE)"));
-        bool ok = run_and_upload_session(ntp_now_unix); // ★ NTP時刻を渡す
+        Serial.println(F("[NET] Starting STM session & /publish upload (EARLY ACK + LittleFS)"));
+        bool ok = run_and_upload_session(ntp_now_unix);
         Serial.print(F("[RESULT] ")); Serial.println(ok ? F("OK") : F("FAIL"));
 
       } else {
